@@ -1,0 +1,826 @@
+# Board: Adafruit MatrixPortal ESP32-S3
+# Definition: definitions/boards/adafruit_matrixportal_esp32s3/manifest.yaml
+
+
+esphome:
+  name: bedroom-clock
+  friendly_name: Bedroom Clock
+  on_boot:
+    priority: -100
+    then:
+      - script.execute: seed_default_colors
+      - script.execute: apply_brightness
+
+esp32:
+  board: adafruit_matrixportal_esp32s3
+  variant: esp32s3
+  flash_size: 8MB
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: "oy492MQXQF0VmmXXcxWOmj1ZpXZt7blaRHYc9UK0vKc="
+
+# Without this you can only update over USB. Delete if that's intentional.
+ota:
+  - platform: esphome
+    password: "qxrlmWl0i5TW"
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: Bedroom Clock Fallback Hotspot
+    password: "qxrlmWl0i5TW"
+
+captive_portal:
+####################################################################
+# Adaptive Matrix Clock
+#   Adafruit Matrix Portal S3 + 64x32 HUB75 panel + BH1750
+#
+#   Dark mode  : big time, big feels-like temp
+#   Light mode : small time + temp, weather icon, scrolling condition
+#   Test mode  : bypasses both, for confirming the panel works
+#
+#   HA controls: Dark Threshold, Light Threshold,
+#                Dark Brightness, Light Brightness,
+#                5 colour pickers, Test Message,
+#                Display Test Mode / Display Test (15s)
+####################################################################
+
+substitutions:
+  # Entities pulled from Home Assistant
+  feels_like_entity: sensor.weather_station_feels_like_temperature
+  condition_entity:  sensor.kingston_current_condition
+  weather_entity:    weather.kingston_forecast
+
+
+# The MatrixPortal S3 has 2MB of quad PSRAM. Not required for a 64x32
+# panel, but harmless and useful if you later add images.
+psram:
+  mode: quad
+  speed: 80MHz
+
+
+
+
+time:
+  - platform: homeassistant
+    id: ha_time
+
+####################################################################
+# I2C + ambient light sensor
+####################################################################
+
+# STEMMA QT on the MatrixPortal S3. If the BH1750 isn't found, check
+# the "Found i2c device at address 0x23" line in the boot log and
+# adjust these two pins.
+i2c:
+  sda: GPIO16
+  scl: GPIO17
+  scan: true
+
+####################################################################
+# Globals
+####################################################################
+
+globals:
+  - id: is_dark
+    type: bool
+    restore_value: true
+    initial_value: 'true'
+
+  - id: scroll_offset
+    type: int
+    restore_value: false
+    initial_value: '0'
+
+  # Used to seed sensible default colours on very first boot only
+  - id: colors_initialized
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+
+  # Tracks a mode flip that is waiting out the dwell timer
+  - id: pending_active
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: pending_dark
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: pending_since
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+
+####################################################################
+# HA-facing controls (these appear automatically as sliders)
+####################################################################
+
+number:
+  - platform: template
+    name: "Dark Threshold"
+    id: dark_threshold
+    icon: mdi:weather-night
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_value: 15
+    min_value: 0
+    max_value: 300
+    step: 1
+    unit_of_measurement: "lx"
+    # box = typed number input. A slider over a 0-1000 lux
+    # range can't resolve single lux values by dragging.
+    mode: box
+
+  - platform: template
+    name: "Light Threshold"
+    id: light_threshold
+    icon: mdi:white-balance-sunny
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_value: 45
+    min_value: 0
+    max_value: 1000
+    step: 1
+    unit_of_measurement: "lx"
+    # box = typed number input. A slider over a 0-1000 lux
+    # range can't resolve single lux values by dragging.
+    mode: box
+
+  - platform: template
+    name: "Mode Switch Delay"
+    id: switch_delay
+    icon: mdi:timer-sand
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_value: 10
+    min_value: 0
+    max_value: 300
+    step: 1
+    unit_of_measurement: "s"
+    mode: slider
+
+  - platform: template
+    name: "Dark Mode Brightness"
+    id: dark_brightness
+    icon: mdi:brightness-3
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_value: 12
+    min_value: 1
+    max_value: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+    on_value:
+      - script.execute: apply_brightness
+
+  - platform: template
+    name: "Light Mode Brightness"
+    id: light_brightness
+    icon: mdi:brightness-7
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_value: 70
+    min_value: 1
+    max_value: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+    on_value:
+      - script.execute: apply_brightness
+
+####################################################################
+# Sensors
+####################################################################
+
+sensor:
+  - platform: bh1750
+    name: "Ambient Light"
+    id: ambient_lux
+    address: 0x23
+    # In low light the BH1750 stretches its integration time to nearly
+    # a second, so faster intervals just log "Previous measurement not
+    # complete" and skip. 1s matches what the sensor can actually do.
+    # No averaging filter: the dwell timer below rejects transients.
+    update_interval: 1s
+    on_value:
+      then:
+        - lambda: |-
+            // Which mode does the current light level call for?
+            // Between the two thresholds nothing changes: that gap
+            // IS the hysteresis band. Keep light > dark.
+            bool want_dark = id(is_dark);
+            if (x < id(dark_threshold).state) {
+              want_dark = true;
+            } else if (x > id(light_threshold).state) {
+              want_dark = false;
+            }
+
+            if (want_dark == id(is_dark)) {
+              // Already there — cancel any countdown in progress
+              if (id(pending_active)) {
+                ESP_LOGD("mode", "%.1f lx -> countdown cancelled", x);
+              }
+              id(pending_active) = false;
+              return;
+            }
+
+            uint32_t now = millis();
+            uint32_t dwell = (uint32_t) (id(switch_delay).state * 1000.0f);
+            // Half a sample period of slack, so sampling jitter
+            // (e.g. 2,997 ms measured for a 3 s delay) can't cost an
+            // extra full sample before committing.
+            const uint32_t SLACK = 250;
+
+            if (!id(pending_active) || id(pending_dark) != want_dark) {
+              // Start (or restart) the countdown
+              id(pending_active) = true;
+              id(pending_dark) = want_dark;
+              id(pending_since) = now;
+              ESP_LOGD("mode", "%.1f lx -> START %s countdown (t=%u ms)",
+                       x, want_dark ? "DARK" : "LIGHT", now);
+            } else {
+              // One line per sample while waiting: shows the real
+              // sample cadence, which is the thing we're checking
+              ESP_LOGD("mode", "%.1f lx    pending %u ms",
+                       x, now - id(pending_since));
+            }
+
+            // Commit once the level has stayed past the threshold for
+            // the full dwell time. A brief spike never gets here.
+            if ((now - id(pending_since)) + SLACK >= dwell) {
+              ESP_LOGD("mode", "%.1f lx -> COMMIT %s after %u ms",
+                       x, want_dark ? "DARK" : "LIGHT",
+                       now - id(pending_since));
+              id(is_dark) = want_dark;
+              id(pending_active) = false;
+              id(apply_brightness).execute();
+            }
+
+  - platform: homeassistant
+    id: feels_like
+    entity_id: ${feels_like_entity}
+    internal: true
+
+text_sensor:
+  - platform: homeassistant
+    id: current_condition
+    entity_id: ${condition_entity}
+    internal: true
+
+  # A weather entity's state IS its condition string
+  # (sunny, partlycloudy, rainy, ...)
+  - platform: homeassistant
+    id: forecast_condition
+    entity_id: ${weather_entity}
+    internal: true
+
+binary_sensor:
+  - platform: template
+    name: "Dark Mode Active"
+    id: dark_mode_active
+    icon: mdi:theme-light-dark
+    lambda: 'return id(is_dark);'
+
+  # On while a flip is waiting out the Mode Switch Delay. Handy for
+  # seeing whether the delay is set sensibly for your room.
+  - platform: template
+    name: "Mode Change Pending"
+    id: mode_change_pending
+    icon: mdi:timer-sand
+    entity_category: diagnostic
+    lambda: 'return id(pending_active);'
+
+####################################################################
+# Display test / bypass
+####################################################################
+
+switch:
+  - platform: template
+    name: "12 Hour Time"
+    id: twelve_hour
+    icon: mdi:clock-outline
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  - platform: template
+    name: "Display Test Mode"
+    id: test_mode
+    icon: mdi:test-tube
+    optimistic: true
+    restore_mode: ALWAYS_OFF   # never come back from a reboot stuck in test
+    turn_on_action:
+      - script.execute: apply_brightness
+    turn_off_action:
+      - script.execute: apply_brightness
+
+button:
+  - platform: template
+    name: "Display Test (15s)"
+    icon: mdi:television-play
+    on_press:
+      - switch.turn_on: test_mode
+      - delay: 15s
+      - switch.turn_off: test_mode
+
+text:
+  - platform: template
+    name: "Test Message"
+    id: test_message
+    icon: mdi:message-text
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_value: "Hello World"
+    min_length: 0
+    max_length: 24
+    mode: text
+
+####################################################################
+# Colour pickers
+#
+# Each colour is an `rgb` light backed by three dummy outputs. Nothing
+# is actually driven by the outputs — the display lambda reads the
+# light's colour and applies it when drawing. This is what gets you a
+# real colour wheel in HA instead of three R/G/B number sliders.
+#
+# Each light's own brightness acts as a per-element dimmer, layered on
+# top of the panel-wide Dark/Light Brightness sliders. Turning a light
+# off hides that element entirely.
+####################################################################
+
+output:
+  - { platform: template, id: o_dt_r, type: float, write_action: [lambda: '(void)state;'] }
+  - { platform: template, id: o_dt_g, type: float, write_action: [lambda: '(void)state;'] }
+  - { platform: template, id: o_dt_b, type: float, write_action: [lambda: '(void)state;'] }
+
+  - { platform: template, id: o_dp_r, type: float, write_action: [lambda: '(void)state;'] }
+  - { platform: template, id: o_dp_g, type: float, write_action: [lambda: '(void)state;'] }
+  - { platform: template, id: o_dp_b, type: float, write_action: [lambda: '(void)state;'] }
+
+  - { platform: template, id: o_lt_r, type: float, write_action: [lambda: '(void)state;'] }
+  - { platform: template, id: o_lt_g, type: float, write_action: [lambda: '(void)state;'] }
+  - { platform: template, id: o_lt_b, type: float, write_action: [lambda: '(void)state;'] }
+
+  - { platform: template, id: o_lp_r, type: float, write_action: [lambda: '(void)state;'] }
+  - { platform: template, id: o_lp_g, type: float, write_action: [lambda: '(void)state;'] }
+  - { platform: template, id: o_lp_b, type: float, write_action: [lambda: '(void)state;'] }
+
+  - { platform: template, id: o_la_r, type: float, write_action: [lambda: '(void)state;'] }
+  - { platform: template, id: o_la_g, type: float, write_action: [lambda: '(void)state;'] }
+  - { platform: template, id: o_la_b, type: float, write_action: [lambda: '(void)state;'] }
+
+light:
+  - platform: rgb
+    name: "Dark Mode Time Colour"
+    id: col_dark_time
+    icon: mdi:palette
+    red: o_dt_r
+    green: o_dt_g
+    blue: o_dt_b
+    gamma_correct: 1.0
+    default_transition_length: 0s
+    restore_mode: RESTORE_DEFAULT_ON
+
+  - platform: rgb
+    name: "Dark Mode Temp Colour"
+    id: col_dark_temp
+    icon: mdi:palette
+    red: o_dp_r
+    green: o_dp_g
+    blue: o_dp_b
+    gamma_correct: 1.0
+    default_transition_length: 0s
+    restore_mode: RESTORE_DEFAULT_ON
+
+  - platform: rgb
+    name: "Light Mode Time Colour"
+    id: col_light_time
+    icon: mdi:palette
+    red: o_lt_r
+    green: o_lt_g
+    blue: o_lt_b
+    gamma_correct: 1.0
+    default_transition_length: 0s
+    restore_mode: RESTORE_DEFAULT_ON
+
+  - platform: rgb
+    name: "Light Mode Temp Colour"
+    id: col_light_temp
+    icon: mdi:palette
+    red: o_lp_r
+    green: o_lp_g
+    blue: o_lp_b
+    gamma_correct: 1.0
+    default_transition_length: 0s
+    restore_mode: RESTORE_DEFAULT_ON
+
+  # Drives both the weather icon and the scrolling condition text
+  - platform: rgb
+    name: "Light Mode Accent Colour"
+    id: col_light_accent
+    icon: mdi:palette
+    red: o_la_r
+    green: o_la_g
+    blue: o_la_b
+    gamma_correct: 1.0
+    default_transition_length: 0s
+    restore_mode: RESTORE_DEFAULT_ON
+
+####################################################################
+# Fonts
+####################################################################
+
+font:
+  # Silkscreen is a true pixel font — crisp at multiples of 8px
+  # Dark mode clock: DSEG7 Classic Mini Bold, a seven-segment face.
+  # Nothing but thick rectangular bars, so no feature is thinner than
+  # a whole pixel - it cannot break up at low brightness the way an
+  # anti-aliased font does. bpp stays at the default 1 deliberately.
+  #
+  # Local file, relative to this YAML's folder. SIL OFL licensed.
+  # Size 18 is a STARTING POINT only: check the worst-case width in
+  # the log line from draw_time and adjust. Point sizes are not
+  # comparable to Silkscreen - DSEG7 digits fill nearly the whole
+  # ascender, so this gives taller digits than the number suggests.
+  - file: "fonts/DSEG7ClassicMini-Bold.ttf"
+    id: font_time
+    size: 18
+    glyphs: "0123456789: "
+
+  # Dark mode temperature. Same reasoning: pixel font, bpp 1.
+  - file:
+      type: gfonts
+      family: Silkscreen
+      weight: bold
+    id: font_big
+    size: 16
+    glyphs: "0123456789:.-° "
+
+  - file:
+      type: gfonts
+      family: Silkscreen
+    id: font_small
+    size: 8
+    glyphs: "!\"%()+=,-_.:°/0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz "
+
+  - file: "https://github.com/Templarian/MaterialDesign-Webfont/raw/master/fonts/materialdesignicons-webfont.ttf"
+    id: font_icons
+    size: 20
+    glyphs: [
+      "\U000F0026",  # alert            (exceptional / unknown)
+      "\U000F0590",  # weather-cloudy
+      "\U000F0591",  # weather-fog
+      "\U000F0592",  # weather-hail
+      "\U000F0593",  # weather-lightning
+      "\U000F0594",  # weather-night
+      "\U000F0595",  # weather-partly-cloudy
+      "\U000F0596",  # weather-pouring
+      "\U000F0597",  # weather-rainy
+      "\U000F0598",  # weather-snowy
+      "\U000F0599",  # weather-sunny
+      "\U000F059D",  # weather-windy
+      "\U000F059E",  # weather-windy-variant
+      "\U000F067E",  # weather-lightning-rainy
+      "\U000F067F",  # weather-snowy-rainy
+    ]
+
+####################################################################
+# Display
+####################################################################
+
+display:
+  - platform: hub75
+    id: matrix
+    # Explicit pins instead of `board: adafruit-matrix-portal-s3`,
+    # because on this panel GREEN and BLUE come out swapped. The pins
+    # below are Adafruit's MatrixPortal S3 mapping with G and B
+    # exchanged on BOTH halves:
+    #   stock:    G1=41 B1=40   G2=39 B2=37
+    #   swapped:  G1=40 B1=41   G2=37 B2=39
+    # Fixing it here rather than in the colour code means literal
+    # colours (test bars, divider line) are correct too.
+    r1_pin: GPIO42
+    g1_pin: GPIO40
+    b1_pin: GPIO41
+    r2_pin: GPIO38
+    g2_pin: GPIO37
+    b2_pin: GPIO39
+    a_pin: GPIO45
+    b_pin: GPIO36
+    c_pin: GPIO48
+    d_pin: GPIO35
+    # No e_pin: 1/16-scan 64x32 panels don't use the E address line
+    clk_pin: GPIO2
+    lat_pin: GPIO47
+    oe_pin: GPIO14
+    panel_width: 64
+    panel_height: 32
+    brightness: 64                     # overridden at boot by the script
+    update_interval: 40ms              # how often the LAMBDA redraws
+    # --- panel refresh rate (unrelated to update_interval) ---
+    # Refresh scales with clock_speed and inversely with 2^bit_depth.
+    # 6 bits is plenty for flat colours and roughly quadruples the
+    # refresh rate vs the default 8. Raise to 8 only if you see
+    # banding in a gradient.
+    clock_speed: 20MHZ
+    bit_depth: 6
+    latch_blanking: 1
+    lambda: |-
+      //////////////////////////////////////////////////////////////
+      // TEST MODE — bypasses everything, works with no time and no
+      // sensors. Border proves the panel geometry and that no edge
+      // rows/columns are dead; the three bars prove R/G/B are not
+      // swapped (a very common HUB75 miswire).
+      //////////////////////////////////////////////////////////////
+      if (id(test_mode).state) {
+        it.rectangle(0, 0, 64, 32, Color(255, 255, 255));
+
+        std::string tmsg = id(test_message).state;
+        if (tmsg.empty()) tmsg = "Hello World";
+
+        it.start_clipping(2, 2, 61, 17);
+        it.print(32, 10, id(font_small), Color(255, 255, 255),
+                 TextAlign::CENTER, tmsg.c_str());
+        it.end_clipping();
+
+        it.filled_rectangle( 3, 20, 18, 8, Color(255,   0,   0));
+        it.filled_rectangle(24, 20, 17, 8, Color(  0, 255,   0));
+        it.filled_rectangle(46, 20, 15, 8, Color(  0,   0, 255));
+        return;
+      }
+
+      // ---------- palette, read live from the colour lights ----------
+      auto col = [](esphome::light::LightState *ls) -> Color {
+        auto v = ls->remote_values;
+        float k = v.get_state() * v.get_brightness();
+        return Color((uint8_t) (v.get_red()   * k * 255.0f),
+                     (uint8_t) (v.get_green() * k * 255.0f),
+                     (uint8_t) (v.get_blue()  * k * 255.0f));
+      };
+
+      const Color C_TIME_DARK  = col(id(col_dark_time));
+      const Color C_TEMP_DARK  = col(id(col_dark_temp));
+      const Color C_TIME_LIGHT = col(id(col_light_time));
+      const Color C_TEMP_LIGHT = col(id(col_light_temp));
+      const Color C_ACCENT     = col(id(col_light_accent));
+      const Color C_RULE       = Color(25, 25, 40);
+
+      auto t = id(ha_time).now();
+      if (!t.is_valid()) {
+        it.print(32, 21, id(font_big), Color(60,60,60),
+                 TextAlign::BASELINE_CENTER, "--:--");
+        return;
+      }
+
+      // y is the BASELINE row: the row the digits sit on, which
+      // ignores the font's leading entirely.
+      //
+      // Draws HH:MM ONE CHARACTER AT A TIME so each can have its own
+      // advance width. DSEG7 is monospaced because it emulates a
+      // physical seven-segment cell, and its '1' is just the two
+      // right-hand vertical segments lit inside that full-width cell.
+      // The empty space is therefore INSIDE the glyph, which is why no
+      // font or tracking setting can close it.
+      //
+      // one_trim narrows the '1' cell by that many pixels, and the '1'
+      // is drawn right-aligned inside the narrower cell so its
+      // segments stay put while the space ahead of them closes up.
+      // Per-font: DSEG7 wants a few px, a pixel font wants 0.
+      //
+      // If the gap closes on the WRONG side - i.e. the '1' ends up
+      // crowding the character after it instead - this font centres
+      // its '1' in the cell rather than right-aligning it. Change the
+      // BASELINE_RIGHT below to BASELINE_LEFT and re-flash.
+      auto draw_time = [&](int x, int y, auto *f, Color c,
+                           bool centered, int one_trim) {
+        char buf[8];
+        if (id(twelve_hour).state) {
+          int h12 = t.hour % 12;
+          if (h12 == 0) h12 = 12;              // midnight and noon
+          snprintf(buf, sizeof(buf), "%d:%02d", h12, t.minute);
+        } else {
+          snprintf(buf, sizeof(buf), "%02d:%02d", t.hour, t.minute);
+        }
+
+        // Measure a representative digit and the colon once per frame.
+        // DSEG7 is monospaced, so "0" stands in for every digit.
+        int bx, by, dw, dh;
+        it.get_text_bounds(0, 0, "0", f, TextAlign::BASELINE_LEFT,
+                           &bx, &by, &dw, &dh);
+        int cbx, cby, cw, ch_;
+        it.get_text_bounds(0, 0, ":", f, TextAlign::BASELINE_LEFT,
+                           &cbx, &cby, &cw, &ch_);
+
+        auto advance = [&](char g) -> int {
+          if (g == '1') return dw - one_trim;
+          if (g == ':') return cw;
+          return dw;
+        };
+
+        int total = 0;
+        for (const char *p = buf; *p; ++p) total += advance(*p);
+
+        int cx = centered ? x - total / 2 : x;
+        for (const char *p = buf; *p; ++p) {
+          char one[2] = { *p, '\0' };
+          int w = advance(*p);
+          if (*p == '1') {
+            it.print(cx + w, y, f, c, TextAlign::BASELINE_RIGHT, one);
+          } else {
+            it.print(cx, y, f, c, TextAlign::BASELINE_LEFT, one);
+          }
+          cx += w;
+        }
+
+        // Logs the COMPOSED width, which now varies with how many 1s
+        // are in the time. Panel is 64 wide x 32 tall.
+        static int logged_minute = -1;
+        if (centered && t.minute != logged_minute) {
+          logged_minute = t.minute;
+          ESP_LOGI("clock", "\"%s\" drawn %d px wide (limit 64) | digit "
+                            "%d, colon %d, trim %d | box top %d above "
+                            "baseline",
+                   buf, total, dw, cw, one_trim, -by);
+        }
+      };
+
+      //////////////////////////////////////////////////////////////
+      // DARK MODE — 20px clock pinned to the top, 16px temp below
+      //////////////////////////////////////////////////////////////
+      if (id(is_dark)) {
+        // Baseline rows: the row each element's digits SIT ON.
+        // 32 rows is the hard budget: clock_cap + temp_cap + gap <= 32.
+        const int TIME_BASELINE = 18;
+        const int TEMP_BASELINE = 31;
+
+        // Pixels shaved off the '1' cell. Raise to tighten further, 0
+        // to turn it off and get plain monospaced digits back.
+        //
+        // NOTE this makes the total width depend on the time: "11:11"
+        // is now narrower than "20:48", so a centred block shifts a
+        // little at some minute changes. If that bothers you more than
+        // the wide 1 did, set ONE_TRIM to 0.
+        const int ONE_TRIM = 5;
+
+        draw_time(32, TIME_BASELINE, id(font_time), C_TIME_DARK,
+                  true, ONE_TRIM);
+
+        if (id(feels_like).has_state()) {
+          // Back to the font's own ° glyph: at bpp 1 Silkscreen
+          // renders it as a crisp 2x2 block, so the hand-drawn ring
+          // workaround isn't needed any more.
+          it.printf(32, TEMP_BASELINE, id(font_big), C_TEMP_DARK,
+                    TextAlign::BASELINE_CENTER, "%.0f°",
+                    id(feels_like).state);
+        }
+        return;
+      }
+
+      //////////////////////////////////////////////////////////////
+      // LIGHT MODE
+      //////////////////////////////////////////////////////////////
+
+      // Top strip: small time left, feels-like right, both sitting on
+      // row 7 so the 8px pixel font fills rows 1-7.
+      const int STRIP_BASELINE = 7;
+
+      // trim 0: Silkscreen's '1' fills its cell normally, nothing to
+      // claw back, and at 8px a 1px change would be very visible.
+      draw_time(1, STRIP_BASELINE, id(font_small), C_TIME_LIGHT,
+                false, 0);
+
+      if (id(feels_like).has_state()) {
+        it.printf(63, STRIP_BASELINE, id(font_small), C_TEMP_LIGHT,
+                  TextAlign::BASELINE_RIGHT, "%.0f°", id(feels_like).state);
+      }
+
+      it.line(0, 9, 63, 9, C_RULE);
+
+      // Weather icon, mapped from the weather entity's state
+      static const std::map<std::string, const char *> ICONS = {
+        {"clear-night",     "\U000F0594"},
+        {"cloudy",          "\U000F0590"},
+        {"fog",             "\U000F0591"},
+        {"hail",            "\U000F0592"},
+        {"lightning",       "\U000F0593"},
+        {"lightning-rainy", "\U000F067E"},
+        {"partlycloudy",    "\U000F0595"},
+        {"pouring",         "\U000F0596"},
+        {"rainy",           "\U000F0597"},
+        {"snowy",           "\U000F0598"},
+        {"snowy-rainy",     "\U000F067F"},
+        {"sunny",           "\U000F0599"},
+        {"windy",           "\U000F059D"},
+        {"windy-variant",   "\U000F059E"},
+      };
+
+      const char *glyph = "\U000F0026";
+      if (id(forecast_condition).has_state()) {
+        auto hit = ICONS.find(id(forecast_condition).state);
+        if (hit != ICONS.end()) glyph = hit->second;
+      }
+      it.print(11, 21, id(font_icons), C_ACCENT, TextAlign::CENTER, glyph);
+
+      // Condition text in the region to the right of the icon
+      std::string msg = id(current_condition).has_state()
+                        ? id(current_condition).state : "";
+      if (msg.empty()) msg = id(forecast_condition).has_state()
+                        ? id(forecast_condition).state : "--";
+
+      const int RX = 24, RW = 40;   // region x, region width
+
+      int bx, by, bw, bh;
+      it.get_text_bounds(0, 0, msg.c_str(), id(font_small),
+                         TextAlign::TOP_LEFT, &bx, &by, &bw, &bh);
+
+      it.start_clipping(RX, 10, 63, 31);
+      if (bw <= RW) {
+        it.print(RX + RW / 2, 21, id(font_small), C_ACCENT,
+                 TextAlign::CENTER, msg.c_str());
+      } else {
+        int span = bw + RW;
+        // Wrap the counter itself rather than taking a modulo of an
+        // ever-growing int, so it stays bounded and can never overflow.
+        id(scroll_offset) = (id(scroll_offset) + 1) % span;
+        int x = RX + RW - id(scroll_offset);
+        it.print(x, 21, id(font_small), C_ACCENT,
+                 TextAlign::CENTER_LEFT, msg.c_str());
+      }
+      it.end_clipping();
+
+####################################################################
+# Scripts
+####################################################################
+
+script:
+  # Runs once, on the very first boot. After that your choices in HA
+  # persist and this never touches them again.
+  - id: seed_default_colors
+    then:
+      - if:
+          condition:
+            lambda: 'return !id(colors_initialized);'
+          then:
+            - light.turn_on:
+                id: col_dark_time
+                red: 100%
+                green: 22%
+                blue: 0%
+                brightness: 100%
+            - light.turn_on:
+                id: col_dark_temp
+                red: 100%
+                green: 22%
+                blue: 0%
+                brightness: 45%
+            - light.turn_on:
+                id: col_light_time
+                red: 100%
+                green: 100%
+                blue: 100%
+                brightness: 100%
+            - light.turn_on:
+                id: col_light_temp
+                red: 100%
+                green: 66%
+                blue: 16%
+                brightness: 100%
+            - light.turn_on:
+                id: col_light_accent
+                red: 35%
+                green: 75%
+                blue: 100%
+                brightness: 100%
+            - lambda: 'id(colors_initialized) = true;'
+
+  - id: apply_brightness
+    mode: restart
+    then:
+      # If the validator rejects this, try `display.hub75.set_brightness`
+      - hub75.set_brightness:
+          id: matrix
+          brightness: !lambda |-
+            // Test mode uses a fixed, always-visible level so a
+            // dark-mode setting of 1% can't hide the test pattern.
+            if (id(test_mode).state) return 150;
+            float pct = id(is_dark) ? id(dark_brightness).state
+                                    : id(light_brightness).state;
+            int v = (int) (pct * 2.55f);
+            if (v < 1) v = 1;
+            if (v > 255) v = 255;
+            return v;
