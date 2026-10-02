@@ -1,5 +1,5 @@
 # Home Assistant Bedroom Clock
-Bedroom Clock that displays time and weather data driectly driven from Home Assistant. 
+Bedroom Clock that displays time and weather data directly driven from Home Assistant. 
 
 I should note that the ESPhome Yaml was created with the asistance of Claude
 
