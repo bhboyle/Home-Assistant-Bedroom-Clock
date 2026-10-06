@@ -1,4 +1,8 @@
+Day Mode
 ![Clock Picture](Clock_image.jpg)
+
+Night Mode
+![Clock Picture](Clock-night.jpg)
 
 # Home Assistant Bedroom Clock
 Bedroom Clock that displays time and weather data directly driven from Home Assistant. 
