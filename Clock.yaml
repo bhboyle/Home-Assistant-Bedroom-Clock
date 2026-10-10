@@ -446,7 +446,6 @@ light:
 ####################################################################
 
 font:
-  # Silkscreen is a true pixel font — crisp at multiples of 8px
   # Dark mode clock: DSEG7 Classic Mini Bold, a seven-segment face.
   # Nothing but thick rectangular bars, so no feature is thinner than
   # a whole pixel - it cannot break up at low brightness the way an
@@ -462,13 +461,22 @@ font:
     size: 18
     glyphs: "0123456789: "
 
-  # Dark mode temperature. Same reasoning: pixel font, bpp 1.
-  - file:
-      type: gfonts
-      family: Silkscreen
-      weight: bold
+  # Dark mode temperature: the SAME DSEG7 file as the clock, just
+  # smaller, so the two elements match. DSEG added a real DEGREE SIGN
+  # (U+00B0) to the family, so this gives a proper raised ring instead
+  # of Silkscreen's 2x2 block.
+  #
+  # '-' is the middle segment, so negative temps are fine.
+  #
+  # Size 12 leaves rows ~19-31 for the temp under an 18px clock whose
+  # digits reach row 17. Drop to 11 if the two touch.
+  #
+  # If the compile fails on a missing '°' glyph, this copy of DSEG
+  # predates that addition - see the note at the TEMP_BASELINE block
+  # for the fallback.
+  - file: "fonts/DSEG7ClassicMini-Bold.ttf"
     id: font_big
-    size: 16
+    size: 12
     glyphs: "0123456789:.-° "
 
   - file:
@@ -680,10 +688,15 @@ display:
         draw_time(32, TIME_BASELINE, id(font_time), C_TIME_DARK,
                   true, ONE_TRIM);
 
+        // font_big is now the same DSEG7 file as the clock, so the
+        // temp matches it and uses DSEG's own degree glyph.
+        //
+        // IF THE COMPILE FAILS on a missing '°': drop the ° from
+        // font_big's glyph list, print "%.0f" here instead, and add
+        // the ring back by hand with
+        //   it.rectangle(x, TEMP_BASELINE - 9, 3, 3, C_TEMP_DARK);
+        // placed just right of the number.
         if (id(feels_like).has_state()) {
-          // Back to the font's own ° glyph: at bpp 1 Silkscreen
-          // renders it as a crisp 2x2 block, so the hand-drawn ring
-          // workaround isn't needed any more.
           it.printf(32, TEMP_BASELINE, id(font_big), C_TEMP_DARK,
                     TextAlign::BASELINE_CENTER, "%.0f°",
                     id(feels_like).state);
