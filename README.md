@@ -18,3 +18,5 @@ The display is a 64x32 RGB matrix Purchased from [Amazon](https://www.amazon.ca/
 The driver board is a ESP#@ matrix driver board also purchaed from [Amazon](https://www.amazon.ca/dp/B0GYDMQKGN?ref_=pe_125682630_1045605200_t_fed_asin_title).
 
 The Light sensor is also from [amazon](https://www.amazon.ca/dp/B0DDCD3VZC?ref=ppx_yo2ov_dt_b_fed_asin_title)
+
+I used a font that I had to download. The font for the night mode comes from [here](https://www.keshikan.net/fonts-e.html). You have to download and extract DSEG7ClassicMini-Bold.ttf. Create a "fonts" folder under your "esphome" fonteron your Home Assistant instance. Copy the DSEG7ClassicMini-Bold.ttf font into this folder befoe compiling anf flashing.
